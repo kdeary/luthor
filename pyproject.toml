@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "luthor"
+version = "0.1.0"
+description = "Luthor, the Lu(a)(Py)tho(n) transpiler with a Lua runtime shim."
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+dependencies = [
+    "py-lua-parser>=1.2.2",
+]
+authors = [
+    { name = "Spark Mini Console" },
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "black>=24.3.0",
+]
+
+[project.scripts]
+luthor = "luthor.cli:main"

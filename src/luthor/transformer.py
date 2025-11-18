@@ -1,0 +1,593 @@
+"""Lua AST → Python AST transformer."""
+
+from __future__ import annotations
+
+import ast
+from dataclasses import dataclass
+from typing import Iterable, List, Optional, Sequence
+
+from luaparser import astnodes as lua
+
+
+class TransformerError(RuntimeError):
+    """Raised when the transformer encounters an unsupported node."""
+
+
+@dataclass
+class TransformerConfig:
+    """Holds knobs for the transformer."""
+
+    inject_runtime_import: bool = True
+
+
+class LuaToPythonAstTransformer:
+    """Walks the Lua AST produced by py-lua-parser and builds Python AST."""
+
+    def __init__(self, config: Optional[TransformerConfig] = None) -> None:
+        self.config = config or TransformerConfig()
+        self._function_counter = 0
+
+    # -- entrypoint -----------------------------------------------------
+
+    def transform(self, chunk: lua.Chunk) -> ast.Module:
+        if not isinstance(chunk, lua.Chunk):
+            raise TypeError(f"Expected lua.Chunk, received {type(chunk)!r}")
+        body = self.visit_Block(chunk.body)
+        if self.config.inject_runtime_import:
+            runtime_import = ast.ImportFrom(
+                module="luthor",
+                names=[ast.alias(name="runtime", asname="__lua_runtime")],
+                level=0,
+            )
+            body.insert(0, runtime_import)
+        return ast.Module(body=body, type_ignores=[])
+
+    # -- helpers --------------------------------------------------------
+
+    def _runtime_attr(self, name: str) -> ast.Attribute:
+        return ast.Attribute(
+            value=ast.Name(id="__lua_runtime", ctx=ast.Load()),
+            attr=name,
+            ctx=ast.Load(),
+        )
+
+    def _runtime_call(self, name: str, *args: ast.expr) -> ast.Call:
+        return ast.Call(func=self._runtime_attr(name), args=list(args), keywords=[])
+
+    def _wrap_condition(self, expr: ast.expr) -> ast.expr:
+        """Lua truthiness: only nil/false are falsy."""
+        return self._runtime_call("truthy", expr)
+
+    def _wrap_bool_op(
+        self, runtime_name: str, left: ast.expr, right: ast.expr
+    ) -> ast.Call:
+        """Short-circuit aware bool op via runtime."""
+        return self._runtime_call(
+            runtime_name, self._lambda_wrapper(left), self._lambda_wrapper(right)
+        )
+
+    def _lambda_wrapper(self, expr: ast.expr) -> ast.Lambda:
+        return ast.Lambda(
+            args=ast.arguments(
+                posonlyargs=[],
+                args=[],
+                vararg=None,
+                kwonlyargs=[],
+                kw_defaults=[],
+                kwarg=None,
+                defaults=[],
+            ),
+            body=expr,
+        )
+
+    def _tuple_or_single(self, values: Sequence[ast.expr]) -> ast.expr:
+        if not values:
+            return ast.Constant(None)
+        if len(values) == 1:
+            return values[0]
+        return ast.Tuple(elts=list(values), ctx=ast.Load())
+
+    def _fresh_function_name(self) -> str:
+        name = f"__lua_function_{self._function_counter}"
+        self._function_counter += 1
+        return name
+
+    def _function_binding(self, node) -> tuple[str, Optional[ast.expr]]:
+        if isinstance(node, lua.Name):
+            return node.id, None
+        if isinstance(node, lua.Index):
+            if isinstance(node.idx, lua.Name):
+                candidate = node.idx.id
+            elif isinstance(node.idx, lua.String):
+                candidate = node.idx.s
+            else:
+                candidate = None
+            func_name = candidate if candidate and candidate.isidentifier() else self._fresh_function_name()
+            target = self.visit_Index(node, ctx=ast.Store())
+            return func_name, target
+        raise TransformerError("Function names with complex expressions are not supported yet.")
+
+    def _ensure_store(self, node: ast.AST) -> ast.AST:
+        """Set ctx=Store for assignment targets."""
+        if isinstance(node, ast.Name):
+            node.ctx = ast.Store()
+        elif isinstance(node, ast.Attribute):
+            node.ctx = ast.Store()
+        elif isinstance(node, ast.Subscript):
+            node.ctx = ast.Store()
+        elif isinstance(node, ast.Tuple):
+            node.ctx = ast.Store()
+            for elt in node.elts:
+                self._ensure_store(elt)
+        else:
+            raise TransformerError(f"Unsupported assignment target: {ast.dump(node)}")
+        return node
+
+    def _block(self, block: lua.Block) -> List[ast.stmt]:
+        return self.visit_Block(block)
+
+    def _expr_list(self, nodes: Iterable[lua.Expression]) -> List[ast.expr]:
+        return [self.visit_expression(node) for node in nodes]
+
+    # -- dispatcher -----------------------------------------------------
+
+    def visit(self, node, **kwargs):
+        if node is None:
+            return None
+        method = getattr(
+            self, f"visit_{node.__class__.__name__}", self.generic_visit
+        )
+        return method(node, **kwargs)
+
+    def generic_visit(self, node, **_: object):
+        raise TransformerError(f"Unsupported node: {node.__class__.__name__}")
+
+    # -- structural nodes ----------------------------------------------
+
+    def visit_Block(self, node: lua.Block) -> List[ast.stmt]:
+        python_body: List[ast.stmt] = []
+        for stmt in node.body:
+            converted = self.visit(stmt)
+            if isinstance(converted, list):
+                python_body.extend(converted)
+            elif isinstance(converted, ast.stmt):
+                python_body.append(converted)
+            elif isinstance(converted, ast.expr):
+                python_body.append(ast.Expr(value=converted))
+            else:
+                raise TransformerError(f"Unexpected block translation: {converted!r}")
+        if not python_body:
+            python_body.append(ast.Pass())
+        return python_body
+
+    def visit_Do(self, node: lua.Do) -> List[ast.stmt]:
+        # The `do ... end` block simply injects its body.
+        return self._block(node.body)
+
+    def visit_Assign(self, node: lua.Assign) -> ast.Assign:
+        targets = [self._ensure_store(self.visit_lhs(t)) for t in node.targets]
+        target_count = max(1, len(targets))
+        values = self._expr_list(node.values or [])
+        if not values:
+            values = [ast.Constant(None)] * target_count
+        else:
+            if len(values) < target_count:
+                values = values + [ast.Constant(None)] * (target_count - len(values))
+            elif len(values) > target_count:
+                values = list(values[:target_count])
+        if len(targets) == 1:
+            final_target: ast.expr = targets[0]
+        else:
+            final_target = ast.Tuple(elts=targets, ctx=ast.Store())
+        return ast.Assign(targets=[final_target], value=self._tuple_or_single(values))
+
+    def visit_LocalAssign(self, node: lua.LocalAssign) -> ast.Assign:
+        return self.visit_Assign(node)
+
+    def visit_Return(self, node: lua.Return) -> ast.Return:
+        values = self._expr_list(node.values or [])
+        return ast.Return(value=self._tuple_or_single(values) if values else None)
+
+    def visit_While(self, node: lua.While) -> ast.While:
+        test = self._wrap_condition(self.visit_expression(node.test))
+        body = self._block(node.body)
+        return ast.While(test=test, body=body, orelse=[])
+
+    def visit_Repeat(self, node: lua.Repeat) -> ast.While:
+        body = self._block(node.body)
+        test = self.visit_expression(node.test)
+        guard = ast.If(
+            test=self._wrap_condition(test),
+            body=[ast.Break()],
+            orelse=[],
+        )
+        body.append(guard)
+        return ast.While(test=ast.Constant(True), body=body, orelse=[])
+
+    def visit_Fornum(self, node: lua.Fornum) -> ast.For:
+        target = self._ensure_store(self.visit_Name(node.target, ctx=ast.Store()))
+        if node.step is None:
+            step_expr = ast.Constant(1)
+        elif isinstance(node.step, (int, float)):
+            step_expr = ast.Constant(node.step)
+        else:
+            step_expr = self.visit_expression(node.step)
+        iter_call = self._runtime_call(
+            "numeric_for_iter",
+            self.visit_expression(node.start),
+            self.visit_expression(node.stop),
+            step_expr,
+        )
+        return ast.For(
+            target=target,
+            iter=iter_call,
+            body=self._block(node.body),
+            orelse=[],
+        )
+
+    def visit_Forin(self, node: lua.Forin) -> ast.For:
+        targets = [self.visit_Name(t, ctx=ast.Store()) for t in node.targets]
+        target_expr: ast.expr
+        if len(targets) == 1:
+            target_expr = targets[0]
+        else:
+            target_expr = ast.Tuple(elts=targets, ctx=ast.Store())
+        iterables = ast.List(
+            elts=[self.visit_expression(expr) for expr in node.iter],
+            ctx=ast.Load(),
+        )
+        iter_call = self._runtime_call("generic_for_iter", iterables)
+        return ast.For(target=target_expr, iter=iter_call, body=self._block(node.body), orelse=[])
+
+    def visit_Break(self, _: lua.Break) -> ast.Break:
+        return ast.Break()
+
+    def visit_Continue(self, _: lua.Continue) -> ast.Continue:
+        return ast.Continue()
+
+    def visit_SemiColon(self, _: lua.SemiColon) -> ast.Pass:
+        return ast.Pass()
+
+    def visit_If(self, node: lua.If) -> ast.If:
+        return ast.If(
+            test=self._wrap_condition(self.visit_expression(node.test)),
+            body=self._block(node.body),
+            orelse=self._convert_orelse(node.orelse),
+        )
+
+    def _convert_orelse(self, node) -> List[ast.stmt]:
+        if node is None:
+            return []
+        if isinstance(node, list):
+            return [self.visit(stmt) for stmt in node]
+        if isinstance(node, lua.Block):
+            return self._block(node)
+        if isinstance(node, lua.ElseIf):
+            return [
+                ast.If(
+                    test=self._wrap_condition(self.visit_expression(node.test)),
+                    body=self._block(node.body),
+                    orelse=self._convert_orelse(node.orelse),
+                )
+            ]
+        raise TransformerError(f"Unexpected orelse payload: {node!r}")
+
+    def visit_Function(self, node: lua.Function):
+        func_name, assignment_target = self._function_binding(node.name)
+        args = self._build_arguments(node.args)
+        body = self._block(node.body)
+        func_def = ast.FunctionDef(
+            name=func_name,
+            args=args,
+            body=body,
+            decorator_list=[],
+            returns=None,
+            type_comment=None,
+        )
+        if assignment_target is None:
+            return func_def
+        assign = ast.Assign(
+            targets=[assignment_target],
+            value=ast.Name(id=func_name, ctx=ast.Load()),
+        )
+        return [func_def, assign]
+
+    def visit_LocalFunction(self, node: lua.LocalFunction) -> ast.FunctionDef:
+        return self.visit_Function(node)
+
+    def visit_Call(self, node: lua.Call) -> ast.Call:
+        return self._build_call(node.func, node.args)
+
+    def visit_Invoke(self, node: lua.Invoke) -> ast.Call:
+        if not isinstance(node.func, lua.Name):
+            raise TransformerError("Complex invoke targets are not supported")
+        method_name = ast.Constant(node.func.id)
+        args = [self.visit_expression(arg) for arg in node.args]
+        return self._runtime_call(
+            "invoke", self.visit_expression(node.source), method_name, *args
+        )
+
+    def visit_Method(self, node: lua.Method):
+        method_name = node.name.id if isinstance(node.name, lua.Name) else None
+        func_name = method_name if method_name and method_name.isidentifier() else self._fresh_function_name()
+        py_args = self._build_arguments(node.args)
+        py_args.args.insert(0, ast.arg(arg="self"))
+        body = self._block(node.body)
+        target = ast.Subscript(
+            value=self.visit_expression(node.source),
+            slice=ast.Constant(method_name) if method_name else self.visit_expression(node.name),
+            ctx=ast.Store(),
+        )
+        func_def = ast.FunctionDef(
+            name=func_name,
+            args=py_args,
+            body=body,
+            decorator_list=[],
+            returns=None,
+            type_comment=None,
+        )
+        assign = ast.Assign(
+            targets=[target],
+            value=ast.Name(id=func_name, ctx=ast.Load()),
+        )
+        return [func_def, assign]
+
+    # -- expressions ----------------------------------------------------
+
+    def visit_expression(self, node: lua.Expression) -> ast.expr:
+        expr = self.visit(node)
+        if isinstance(expr, ast.stmt):
+            raise TransformerError(f"Expected expression, got statement: {node}")
+        return expr
+
+    def visit_lhs(self, node: lua.Lhs) -> ast.expr:
+        expr = self.visit(node)
+        if isinstance(expr, ast.stmt):
+            raise TransformerError(f"Expected LHS expression, got statement: {node}")
+        return expr
+
+    def visit_Name(self, node: lua.Name, ctx: Optional[ast.expr_context] = None) -> ast.Name:
+        return ast.Name(id=node.id, ctx=ctx or ast.Load())
+
+    def visit_Number(self, node: lua.Number) -> ast.Constant:
+        return ast.Constant(node.n)
+
+    def visit_String(self, node: lua.String) -> ast.Constant:
+        return ast.Constant(node.s)
+
+    def visit_Nil(self, _: lua.Nil) -> ast.Constant:
+        return ast.Constant(None)
+
+    def visit_TrueExpr(self, _: lua.TrueExpr) -> ast.Constant:
+        return ast.Constant(True)
+
+    def visit_FalseExpr(self, _: lua.FalseExpr) -> ast.Constant:
+        return ast.Constant(False)
+
+    def visit_Table(self, node: lua.Table) -> ast.expr:
+        field_exprs = []
+        dict_keys: List[ast.expr] = []
+        dict_values: List[ast.expr] = []
+        list_values: List[ast.expr] = []
+        has_keyed = False
+        has_sequential = False
+
+        for field in node.fields:
+            if not isinstance(field, lua.Field):
+                raise TransformerError("Unsupported table field")
+            is_sequence_field = False
+            if field.key is None:
+                is_sequence_field = True
+            elif isinstance(field.key, lua.Number):
+                first_token = getattr(field.key, "_first_token", None)
+                last_token = getattr(field.key, "_last_token", None)
+                is_sequence_field = first_token is None and last_token is None
+
+            if field.key:
+                if isinstance(field.key, lua.Name):
+                    key = ast.Constant(field.key.id)
+                else:
+                    key = self.visit_expression(field.key)
+            else:
+                key = ast.Constant(None)
+            value = self.visit_expression(field.value)
+            is_keyed = not is_sequence_field
+
+            if is_keyed:
+                has_keyed = True
+                dict_keys.append(key)
+                dict_values.append(value)
+            else:
+                has_sequential = True
+                list_values.append(value)
+
+            field_exprs.append(
+                ast.Tuple(elts=[ast.Constant(is_keyed), key, value], ctx=ast.Load())
+            )
+
+        if has_keyed and not has_sequential:
+            return ast.Dict(keys=dict_keys, values=dict_values)
+        if has_sequential and not has_keyed:
+            return ast.List(elts=list_values, ctx=ast.Load())
+
+        return self._runtime_call(
+            "table_ctor", ast.List(elts=field_exprs, ctx=ast.Load())
+        )
+
+    def visit_Field(self, node: lua.Field):
+        return node  # handled by visit_Table
+
+    def visit_Varargs(self, _: lua.Varargs) -> ast.Name:
+        return ast.Name(id="args", ctx=ast.Load())
+
+    def visit_AnonymousFunction(self, node: lua.AnonymousFunction) -> ast.Lambda:
+        body = self._block(node.body)
+        if len(body) == 1 and isinstance(body[0], ast.Return) and body[0].value is not None:
+            return ast.Lambda(
+                args=self._build_arguments(node.args),
+                body=body[0].value,
+            )
+        raise TransformerError("Anonymous functions with statements are not supported yet.")
+
+    def visit_Index(self, node: lua.Index, ctx: Optional[ast.expr_context] = None) -> ast.Subscript:
+        value_expr = self.visit_expression(node.value)
+        if node.notation == lua.IndexNotation.DOT and isinstance(node.idx, lua.Name):
+            key_expr = ast.Constant(node.idx.id)
+        else:
+            key_expr = self.visit_expression(node.idx)
+        return ast.Subscript(
+            value=value_expr,
+            slice=key_expr,
+            ctx=ctx or ast.Load(),
+        )
+
+    # -- calls / functions ----------------------------------------------
+
+    def _build_arguments(self, args: Sequence[lua.Expression]) -> ast.arguments:
+        py_args: List[ast.arg] = []
+        vararg: Optional[ast.arg] = None
+        for arg in args:
+            if isinstance(arg, lua.Dots):
+                vararg = ast.arg(arg="args")
+            elif isinstance(arg, lua.Name):
+                py_args.append(ast.arg(arg=arg.id))
+            else:
+                raise TransformerError(f"Unsupported function argument {arg!r}")
+        return ast.arguments(
+            posonlyargs=[],
+            args=py_args,
+            vararg=vararg,
+            kwonlyargs=[],
+            kw_defaults=[],
+            kwarg=None,
+            defaults=[],
+        )
+
+    def _build_call(
+        self,
+        func_expr: lua.Expression,
+        args: Sequence[lua.Expression],
+    ) -> ast.Call:
+        func = self.visit_expression(func_expr)
+        return ast.Call(func=func, args=self._expr_list(args), keywords=[])
+
+    # -- operators ------------------------------------------------------
+
+    def visit_AddOp(self, node: lua.AddOp) -> ast.BinOp:
+        return ast.BinOp(
+            left=self.visit_expression(node.left), op=ast.Add(), right=self.visit_expression(node.right)
+        )
+
+    def visit_SubOp(self, node: lua.SubOp) -> ast.BinOp:
+        return ast.BinOp(
+            left=self.visit_expression(node.left), op=ast.Sub(), right=self.visit_expression(node.right)
+        )
+
+    def visit_MultOp(self, node: lua.MultOp) -> ast.BinOp:
+        return ast.BinOp(
+            left=self.visit_expression(node.left), op=ast.Mult(), right=self.visit_expression(node.right)
+        )
+
+    def visit_FloatDivOp(self, node: lua.FloatDivOp) -> ast.BinOp:
+        return ast.BinOp(
+            left=self.visit_expression(node.left), op=ast.Div(), right=self.visit_expression(node.right)
+        )
+
+    def visit_FloorDivOp(self, node: lua.FloorDivOp) -> ast.BinOp:
+        return ast.BinOp(
+            left=self.visit_expression(node.left), op=ast.FloorDiv(), right=self.visit_expression(node.right)
+        )
+
+    def visit_ModOp(self, node: lua.ModOp) -> ast.BinOp:
+        return ast.BinOp(
+            left=self.visit_expression(node.left), op=ast.Mod(), right=self.visit_expression(node.right)
+        )
+
+    def visit_ExpoOp(self, node: lua.ExpoOp) -> ast.BinOp:
+        return ast.BinOp(
+            left=self.visit_expression(node.left), op=ast.Pow(), right=self.visit_expression(node.right)
+        )
+
+    def visit_BAndOp(self, node: lua.BAndOp) -> ast.BinOp:
+        return ast.BinOp(
+            left=self.visit_expression(node.left), op=ast.BitAnd(), right=self.visit_expression(node.right)
+        )
+
+    def visit_BOrOp(self, node: lua.BOrOp) -> ast.BinOp:
+        return ast.BinOp(
+            left=self.visit_expression(node.left), op=ast.BitOr(), right=self.visit_expression(node.right)
+        )
+
+    def visit_BXorOp(self, node: lua.BXorOp) -> ast.BinOp:
+        return ast.BinOp(
+            left=self.visit_expression(node.left), op=ast.BitXor(), right=self.visit_expression(node.right)
+        )
+
+    def visit_BShiftLOp(self, node: lua.BShiftLOp) -> ast.BinOp:
+        return ast.BinOp(
+            left=self.visit_expression(node.left), op=ast.LShift(), right=self.visit_expression(node.right)
+        )
+
+    def visit_BShiftROp(self, node: lua.BShiftROp) -> ast.BinOp:
+        return ast.BinOp(
+            left=self.visit_expression(node.left), op=ast.RShift(), right=self.visit_expression(node.right)
+        )
+
+    # Relational
+    def visit_LessThanOp(self, node: lua.LessThanOp) -> ast.Compare:
+        return self._compare(node, ast.Lt())
+
+    def visit_GreaterThanOp(self, node: lua.GreaterThanOp) -> ast.Compare:
+        return self._compare(node, ast.Gt())
+
+    def visit_LessOrEqThanOp(self, node: lua.LessOrEqThanOp) -> ast.Compare:
+        return self._compare(node, ast.LtE())
+
+    def visit_GreaterOrEqThanOp(self, node: lua.GreaterOrEqThanOp) -> ast.Compare:
+        return self._compare(node, ast.GtE())
+
+    def visit_EqToOp(self, node: lua.EqToOp) -> ast.Compare:
+        return self._compare(node, ast.Eq())
+
+    def visit_NotEqToOp(self, node: lua.NotEqToOp) -> ast.Compare:
+        return self._compare(node, ast.NotEq())
+
+    def _compare(self, node: lua.BinaryOp, op: ast.cmpop) -> ast.Compare:
+        return ast.Compare(
+            left=self.visit_expression(node.left),
+            ops=[op],
+            comparators=[self.visit_expression(node.right)],
+        )
+
+    def visit_Concat(self, node: lua.Concat) -> ast.Call:
+        return self._runtime_call(
+            "concat",
+            self.visit_expression(node.left),
+            self.visit_expression(node.right),
+        )
+
+    def visit_UMinusOp(self, node: lua.UMinusOp) -> ast.UnaryOp:
+        return ast.UnaryOp(op=ast.USub(), operand=self.visit_expression(node.operand))
+
+    def visit_UBNotOp(self, node: lua.UBNotOp) -> ast.UnaryOp:
+        return ast.UnaryOp(op=ast.Invert(), operand=self.visit_expression(node.operand))
+
+    def visit_ULNotOp(self, node: lua.ULNotOp) -> ast.Call:
+        return self._runtime_call("lua_not", self.visit_expression(node.operand))
+
+    def visit_ULengthOP(self, node: lua.ULengthOP) -> ast.Call:
+        return self._runtime_call("lua_len", self.visit_expression(node.operand))
+
+    def visit_AndLoOp(self, node: lua.AndLoOp) -> ast.Call:
+        return self._wrap_bool_op(
+            "lua_and",
+            self.visit_expression(node.left),
+            self.visit_expression(node.right),
+        )
+
+    def visit_OrLoOp(self, node: lua.OrLoOp) -> ast.Call:
+        return self._wrap_bool_op(
+            "lua_or",
+            self.visit_expression(node.left),
+            self.visit_expression(node.right),
+        )
