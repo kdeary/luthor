@@ -251,3 +251,85 @@ def test_table_constructor_with_only_sequence_fields_becomes_list():
     assign = result.module.body[1]
     assert isinstance(assign.value, ast.List)
     assert [elt.value for elt in assign.value.elts] == [1, 2, 3]
+
+
+def test_anonymous_function_with_statements_is_hoisted():
+    result = transpile(
+        """
+        local thunk = function()
+            local sum = 0
+            sum = sum + 1
+            return sum
+        end
+        """
+    )
+    func_def = result.module.body[1]
+    assign = result.module.body[2]
+    assert isinstance(func_def, ast.FunctionDef)
+    assert func_def.name.startswith("__lua_function_")
+    assert isinstance(assign, ast.Assign)
+    assert isinstance(assign.value, ast.Name)
+    assert assign.value.id == func_def.name
+
+
+def test_pico8_globals_are_wrapped_with_pyco8():
+    result = transpile(
+        """
+        x = rnd(5)
+        """
+    )
+    assign = result.module.body[1]
+    call = assign.value
+    assert isinstance(call.func, ast.Subscript)
+    assert isinstance(call.func.value, ast.Name)
+    assert call.func.value.id == "PYCO8"
+    assert isinstance(call.func.slice, ast.Constant)
+    assert call.func.slice.value == "rnd"
+
+
+def test_local_shadowing_skips_pyco8_wrap():
+    result = transpile(
+        """
+        local rnd = 1
+        x = rnd
+        """
+    )
+    assign = result.module.body[2]
+    assert isinstance(assign.value, ast.Name)
+    assert assign.value.id == "rnd"
+
+
+def test_goto_translates_to_label_state_machine():
+    result = transpile(
+        """
+        local i = 0
+        ::loop::
+        i = i + 1
+        if i < 3 then
+            goto loop
+        end
+        """
+    )
+    assign = result.module.body[1]
+    loop = result.module.body[2]
+    assert isinstance(assign.targets[0], ast.Name)
+    assert assign.targets[0].id == "_lua_label"
+    assert isinstance(assign.value, ast.Constant)
+    assert assign.value.value == "__start__"
+
+    assert isinstance(loop, ast.While)
+    assert isinstance(loop.body[0], ast.If)
+    label_branch = loop.body[0].orelse[0]
+    assert isinstance(label_branch, ast.If)
+
+    def has_continue(stmts):
+        for stmt in stmts:
+            if isinstance(stmt, ast.Continue):
+                return True
+            for attr in ("body", "orelse"):
+                child = getattr(stmt, attr, None)
+                if isinstance(child, list) and has_continue(child):
+                    return True
+        return False
+
+    assert has_continue(label_branch.body)

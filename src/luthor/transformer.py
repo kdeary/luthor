@@ -8,6 +8,94 @@ from typing import Iterable, List, Optional, Sequence
 
 from luaparser import astnodes as lua
 
+PICO8_GLOBALS = {
+    "abs",
+    "add",
+    "all",
+    "atan2",
+    "band",
+    "bnot",
+    "bor",
+    "bxor",
+    "btn",
+    "btnp",
+    "cartdata",
+    "camera",
+    "circ",
+    "circfill",
+    "clip",
+    "cls",
+    "cocreate",
+    "color",
+    "coresume",
+    "costatus",
+    "count",
+    "cstore",
+    "cursor",
+    "del",
+    "dget",
+    "dset",
+    "elli",
+    "ellib",
+    "ellipse",
+    "ellipsefill",
+    "exit",
+    "fget",
+    "fillp",
+    "flip",
+    "flr",
+    "fset",
+    "line",
+    "log",
+    "map",
+    "match",
+    "max",
+    "memcpy",
+    "memset",
+    "menuitem",
+    "mid",
+    "mget",
+    "min",
+    "mset",
+    "music",
+    "oval",
+    "ovalfill",
+    "pal",
+    "palt",
+    "peek",
+    "peek2",
+    "peek4",
+    "pmem",
+    "poke",
+    "poke2",
+    "poke4",
+    "print",
+    "printh",
+    "pset",
+    "rect",
+    "rectfill",
+    "reload",
+    "rnd",
+    "sfx",
+    "sgn",
+    "sin",
+    "sget",
+    "shl",
+    "shr",
+    "sset",
+    "spr",
+    "sqrt",
+    "sspr",
+    "stat",
+    "sub",
+    "tabadd",
+    "time",
+    "tline",
+    "tonum",
+    "tostr",
+    "trace",
+}
+
 
 class TransformerError(RuntimeError):
     """Raised when the transformer encounters an unsupported node."""
@@ -26,6 +114,9 @@ class LuaToPythonAstTransformer:
     def __init__(self, config: Optional[TransformerConfig] = None) -> None:
         self.config = config or TransformerConfig()
         self._function_counter = 0
+        self._inline_stack: List[List[ast.stmt]] = []
+        self._current_label_var: Optional[str] = None
+        self._locals_stack: List[set[str]] = [set()]
 
     # -- entrypoint -----------------------------------------------------
 
@@ -123,11 +214,102 @@ class LuaToPythonAstTransformer:
             raise TransformerError(f"Unsupported assignment target: {ast.dump(node)}")
         return node
 
-    def _block(self, block: lua.Block) -> List[ast.stmt]:
-        return self.visit_Block(block)
+    def _block(self, block: lua.Block, initial_locals: Optional[Iterable[str]] = None) -> List[ast.stmt]:
+        return self.visit_Block(block, initial_locals=initial_locals)
 
     def _expr_list(self, nodes: Iterable[lua.Expression]) -> List[ast.expr]:
         return [self.visit_expression(node) for node in nodes]
+
+    def _push_scope(self, names: Optional[Iterable[str]] = None) -> None:
+        scope = set(names or [])
+        self._locals_stack.append(scope)
+
+    def _pop_scope(self) -> None:
+        self._locals_stack.pop()
+
+    def _declare_local(self, name: str) -> None:
+        self._locals_stack[-1].add(name)
+
+    def _declare_locals(self, names: Iterable[str]) -> None:
+        for name in names:
+            self._declare_local(name)
+
+    def _is_local(self, name: str) -> bool:
+        return any(name in scope for scope in reversed(self._locals_stack))
+
+    def _should_wrap_global(self, name: str) -> bool:
+        if name not in PICO8_GLOBALS:
+            return False
+        if name in {"PYCO8", "__lua_runtime", "_lua_label"}:
+            return False
+        return not self._is_local(name)
+
+    def _append_converted(self, body: List[ast.stmt], converted):
+        if converted is None:
+            return
+        if isinstance(converted, list):
+            body.extend(converted)
+        elif isinstance(converted, ast.stmt):
+            body.append(converted)
+        elif isinstance(converted, ast.expr):
+            body.append(ast.Expr(value=converted))
+        else:
+            raise TransformerError(f"Unexpected block translation: {converted!r}")
+
+    def _contains_goto(self, stmts: Sequence[lua.Statement]) -> bool:
+        return any(isinstance(stmt, lua.Label) for stmt in stmts)
+
+    # why does goto exist man...
+    def _translate_goto_block(self, stmts: Sequence[lua.Statement]) -> List[ast.stmt]:
+        label_var = "_lua_label"
+        default_label = "__start__"
+        segments: List[tuple[str, list]] = [(default_label, [])]
+        for stmt in stmts:
+            if isinstance(stmt, lua.Label):
+                label_name = stmt.id.id if isinstance(stmt.id, lua.Name) else str(stmt.id)
+                segments.append((label_name, []))
+            else:
+                segments[-1][1].append(stmt)
+
+        prev_label_var = self._current_label_var
+        self._current_label_var = label_var
+
+        self._declare_local(label_var)
+        init_assign = ast.Assign(
+            targets=[ast.Name(id=label_var, ctx=ast.Store())],
+            value=ast.Constant(segments[0][0]),
+        )
+
+        next_if: Optional[ast.stmt] = None
+        for idx in range(len(segments) - 1, -1, -1):
+            label_name, segment_stmts = segments[idx]
+            branch_body: List[ast.stmt] = []
+            for stmt in segment_stmts:
+                converted = self.visit(stmt)
+                self._append_converted(branch_body, converted)
+            if idx == len(segments) - 1:
+                branch_body.append(ast.Break())
+            else:
+                next_label = segments[idx + 1][0]
+                branch_body.append(
+                    ast.Assign(
+                        targets=[ast.Name(id=label_var, ctx=ast.Store())],
+                        value=ast.Constant(next_label),
+                    )
+                )
+                branch_body.append(ast.Continue())
+
+            test = ast.Compare(
+                left=ast.Name(id=label_var, ctx=ast.Load()),
+                ops=[ast.Eq()],
+                comparators=[ast.Constant(label_name)],
+            )
+            orelse = [next_if] if next_if else [ast.Break()]
+            next_if = ast.If(test=test, body=branch_body, orelse=orelse)
+
+        loop = ast.While(test=ast.Constant(True), body=[next_if], orelse=[])
+        self._current_label_var = prev_label_var
+        return [init_assign, loop]
 
     # -- dispatcher -----------------------------------------------------
 
@@ -144,21 +326,33 @@ class LuaToPythonAstTransformer:
 
     # -- structural nodes ----------------------------------------------
 
-    def visit_Block(self, node: lua.Block) -> List[ast.stmt]:
-        python_body: List[ast.stmt] = []
-        for stmt in node.body:
-            converted = self.visit(stmt)
-            if isinstance(converted, list):
-                python_body.extend(converted)
-            elif isinstance(converted, ast.stmt):
-                python_body.append(converted)
-            elif isinstance(converted, ast.expr):
-                python_body.append(ast.Expr(value=converted))
-            else:
-                raise TransformerError(f"Unexpected block translation: {converted!r}")
-        if not python_body:
-            python_body.append(ast.Pass())
+    def visit_Block(self, node: lua.Block, initial_locals: Optional[Iterable[str]] = None) -> List[ast.stmt]:
+        self._inline_stack.append([])
+        self._push_scope(initial_locals)
+        if self._contains_goto(node.body):
+            python_body = self._translate_goto_block(node.body)
+        else:
+            python_body = []
+            for stmt in node.body:
+                converted = self.visit(stmt)
+                self._append_converted(python_body, converted)
+            if not python_body:
+                python_body.append(ast.Pass())
+        hoisted = self._inline_stack.pop()
+        self._pop_scope()
+        if hoisted:
+            python_body = hoisted + python_body
         return python_body
+
+    def visit_Goto(self, node: lua.Goto):
+        if not self._current_label_var:
+            raise TransformerError("goto used outside of a label-enabled block")
+        label_name = node.label.id if isinstance(node.label, lua.Name) else str(node.label)
+        assign = ast.Assign(
+            targets=[ast.Name(id=self._current_label_var, ctx=ast.Store())],
+            value=ast.Constant(label_name),
+        )
+        return [assign, ast.Continue()]
 
     def visit_Do(self, node: lua.Do) -> List[ast.stmt]:
         # The `do ... end` block simply injects its body.
@@ -182,6 +376,8 @@ class LuaToPythonAstTransformer:
         return ast.Assign(targets=[final_target], value=self._tuple_or_single(values))
 
     def visit_LocalAssign(self, node: lua.LocalAssign) -> ast.Assign:
+        names = [target.id for target in node.targets if isinstance(target, lua.Name)]
+        self._declare_locals(names)
         return self.visit_Assign(node)
 
     def visit_Return(self, node: lua.Return) -> ast.Return:
@@ -274,8 +470,8 @@ class LuaToPythonAstTransformer:
 
     def visit_Function(self, node: lua.Function):
         func_name, assignment_target = self._function_binding(node.name)
-        args = self._build_arguments(node.args)
-        body = self._block(node.body)
+        args, arg_names = self._build_arguments(node.args)
+        body = self._block(node.body, initial_locals=arg_names)
         func_def = ast.FunctionDef(
             name=func_name,
             args=args,
@@ -293,6 +489,8 @@ class LuaToPythonAstTransformer:
         return [func_def, assign]
 
     def visit_LocalFunction(self, node: lua.LocalFunction) -> ast.FunctionDef:
+        if isinstance(node.name, lua.Name):
+            self._declare_local(node.name.id)
         return self.visit_Function(node)
 
     def visit_Call(self, node: lua.Call) -> ast.Call:
@@ -310,9 +508,10 @@ class LuaToPythonAstTransformer:
     def visit_Method(self, node: lua.Method):
         method_name = node.name.id if isinstance(node.name, lua.Name) else None
         func_name = method_name if method_name and method_name.isidentifier() else self._fresh_function_name()
-        py_args = self._build_arguments(node.args)
+        py_args, arg_names = self._build_arguments(node.args)
         py_args.args.insert(0, ast.arg(arg="self"))
-        body = self._block(node.body)
+        locals_list = ["self"] + arg_names
+        body = self._block(node.body, initial_locals=locals_list)
         target = ast.Subscript(
             value=self.visit_expression(node.source),
             slice=ast.Constant(method_name) if method_name else self.visit_expression(node.name),
@@ -346,8 +545,15 @@ class LuaToPythonAstTransformer:
             raise TransformerError(f"Expected LHS expression, got statement: {node}")
         return expr
 
-    def visit_Name(self, node: lua.Name, ctx: Optional[ast.expr_context] = None) -> ast.Name:
-        return ast.Name(id=node.id, ctx=ctx or ast.Load())
+    def visit_Name(self, node: lua.Name, ctx: Optional[ast.expr_context] = None) -> ast.AST:
+        ctx = ctx or ast.Load()
+        if isinstance(ctx, ast.Load) and self._should_wrap_global(node.id):
+            return ast.Subscript(
+                value=ast.Name(id="PYCO8", ctx=ast.Load()),
+                slice=ast.Constant(node.id),
+                ctx=ast.Load(),
+            )
+        return ast.Name(id=node.id, ctx=ctx)
 
     def visit_Number(self, node: lua.Number) -> ast.Constant:
         return ast.Constant(node.n)
@@ -421,13 +627,21 @@ class LuaToPythonAstTransformer:
         return ast.Name(id="args", ctx=ast.Load())
 
     def visit_AnonymousFunction(self, node: lua.AnonymousFunction) -> ast.Lambda:
-        body = self._block(node.body)
-        if len(body) == 1 and isinstance(body[0], ast.Return) and body[0].value is not None:
-            return ast.Lambda(
-                args=self._build_arguments(node.args),
-                body=body[0].value,
-            )
-        raise TransformerError("Anonymous functions with statements are not supported yet.")
+        args, arg_names = self._build_arguments(node.args)
+        body = self._block(node.body, initial_locals=arg_names)
+        func_name = self._fresh_function_name()
+        func_def = ast.FunctionDef(
+            name=func_name,
+            args=args,
+            body=body,
+            decorator_list=[],
+            returns=None,
+            type_comment=None,
+        )
+        if not self._inline_stack:
+            raise TransformerError("Anonymous functions cannot be hoisted without a block context.")
+        self._inline_stack[-1].append(func_def)
+        return ast.Name(id=func_name, ctx=ast.Load())
 
     def visit_Index(self, node: lua.Index, ctx: Optional[ast.expr_context] = None) -> ast.Subscript:
         value_expr = self.visit_expression(node.value)
@@ -443,14 +657,17 @@ class LuaToPythonAstTransformer:
 
     # -- calls / functions ----------------------------------------------
 
-    def _build_arguments(self, args: Sequence[lua.Expression]) -> ast.arguments:
+    def _build_arguments(self, args: Sequence[lua.Expression]) -> tuple[ast.arguments, List[str]]:
         py_args: List[ast.arg] = []
         vararg: Optional[ast.arg] = None
+        locals_list: List[str] = []
         for arg in args:
             if isinstance(arg, lua.Dots):
                 vararg = ast.arg(arg="args")
+                locals_list.append("args")
             elif isinstance(arg, lua.Name):
                 py_args.append(ast.arg(arg=arg.id))
+                locals_list.append(arg.id)
             else:
                 raise TransformerError(f"Unsupported function argument {arg!r}")
         return ast.arguments(
@@ -461,7 +678,7 @@ class LuaToPythonAstTransformer:
             kw_defaults=[],
             kwarg=None,
             defaults=[],
-        )
+        ), locals_list
 
     def _build_call(
         self,
