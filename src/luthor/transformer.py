@@ -677,9 +677,7 @@ class LuaToPythonAstTransformer:
 
     def visit_Index(self, node: lua.Index, ctx: Optional[ast.expr_context] = None):
         value_expr, key_expr = self._index_components(node)
-        if isinstance(ctx, ast.Store):
-            return ast.Subscript(value=value_expr, slice=key_expr, ctx=ast.Store())
-        return self._runtime_call("table_get", value_expr, key_expr)
+        return ast.Subscript(value=value_expr, slice=key_expr, ctx=ctx or ast.Load())
 
     # -- calls / functions ----------------------------------------------
 

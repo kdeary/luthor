@@ -222,16 +222,14 @@ def test_table_access_uses_runtime_helper():
     )
     assign = body_without_prefix(result)[0]
     assert isinstance(assign, ast.Assign)
-    call = assign.value
-    assert isinstance(call, ast.Call)
-    assert call.func.attr == "table_get"
-    first_arg = call.args[0]
-    assert isinstance(first_arg, ast.Call)
-    assert first_arg.func.attr == "table_get"
-    assert isinstance(first_arg.args[1], ast.Constant)
-    assert first_arg.args[1].value == "stats"
-    assert isinstance(call.args[1], ast.Constant)
-    assert call.args[1].value == "health"
+    sub = assign.value
+    assert isinstance(sub, ast.Subscript)
+    inner = sub.value
+    assert isinstance(inner, ast.Subscript)
+    assert isinstance(inner.slice, ast.Constant)
+    assert inner.slice.value == "stats"
+    assert isinstance(sub.slice, ast.Constant)
+    assert sub.slice.value == "health"
 
 
 def test_table_assignment_uses_runtime_helper():

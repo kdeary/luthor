@@ -391,15 +391,6 @@ RUNTIME_EXPORTS = [
     "table_ctor",
     "setmetatable",
     "getmetatable",
-    "table_get",
-    "arith_add",
-    "arith_sub",
-    "arith_mul",
-    "arith_div",
-    "arith_idiv",
-    "arith_mod",
-    "arith_pow",
-    "arith_unm",
 ]
 
 
