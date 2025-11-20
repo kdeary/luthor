@@ -15,7 +15,7 @@ from luaparser.builder import BuilderVisitor
 from luaparser.parser.LuaLexer import LuaLexer
 from luaparser.parser.LuaParser import LuaParser
 
-from .transformer import LuaToPythonAstTransformer
+from .transformer import LuaToPythonAstTransformer, TransformerConfig
 
 
 @dataclass
@@ -29,9 +29,9 @@ class TranspileResult:
 class LuaToPythonTranspiler:
     """Facade combining parsing, AST conversion, and code generation."""
 
-    def __init__(self, *, pretty: bool = True) -> None:
+    def __init__(self, *, pretty: bool = True, config: TransformerConfig | None = None) -> None:
         self._pretty = pretty
-        self._transformer = LuaToPythonAstTransformer()
+        self._transformer = LuaToPythonAstTransformer(config=config)
 
     def transpile_text(self, lua_code: str) -> TranspileResult:
         """Transpile Lua source text into Python source."""
