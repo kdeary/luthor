@@ -21,7 +21,7 @@ def transpile(lua_code: str, *, config: TransformerConfig | None = None):
     return transpiler.transpile_text(snippet)
 
 
-PREFIX_LEN = 1  # runtime import only
+PREFIX_LEN = 4  # runtime import + builtin assignments
 
 
 def body_without_prefix(result):
@@ -32,7 +32,14 @@ def test_empty_chunk_emits_import_and_pass():
     result = transpile("")
     body = result.module.body
     assert isinstance(body[0], ast.ImportFrom)
-    assert isinstance(body[1], ast.Pass)
+    for idx, name in enumerate(["setmetatable", "getmetatable", "pairs"], start=1):
+        assign = body[idx]
+        assert isinstance(assign, ast.Assign)
+        assert isinstance(assign.targets[0], ast.Name)
+        assert assign.targets[0].id == name
+        assert isinstance(assign.value, ast.Attribute)
+        assert assign.value.attr == name
+    assert isinstance(body[4], ast.Pass)
     assert result.source.startswith(
         "from luthor import runtime as __lua_runtime"
     )
@@ -172,6 +179,18 @@ def test_if_elseif_else_chain_produces_nested_ifs():
     nested = first_if.orelse[0]
     assert isinstance(nested, ast.If)
     assert isinstance(nested.orelse[0], ast.Assign)
+
+
+def test_if_comparison_condition_is_not_wrapped():
+    result = transpile(
+        """
+        if a == b then
+            hit = 1
+        end
+        """
+    )
+    first_if = body_without_prefix(result)[0]
+    assert isinstance(first_if.test, ast.Compare)
 
 
 def test_function_table_assignment_for_dot_notation():
@@ -350,11 +369,12 @@ def test_table_constructor_with_only_keyed_fields_becomes_dict():
         """
     )
     assign = body_without_prefix(result)[0]
-    assert isinstance(assign.value, ast.Dict)
-    keys = assign.value.keys
-    values = assign.value.values
-    assert [key.value for key in keys] == ["x", "y"]
-    assert [value.value for value in values] == [1, 2]
+    call = assign.value
+    assert isinstance(call, ast.Call)
+    fields = call.args[0].elts
+    literal_field = fields[0]
+    assert isinstance(literal_field.elts[1], ast.Constant)
+    assert literal_field.elts[1].value == "x"
 
 
 def test_table_constructor_with_only_sequence_fields_becomes_list():
@@ -364,8 +384,24 @@ def test_table_constructor_with_only_sequence_fields_becomes_list():
         """
     )
     assign = body_without_prefix(result)[0]
-    assert isinstance(assign.value, ast.List)
-    assert [elt.value for elt in assign.value.elts] == [1, 2, 3]
+    call = assign.value
+    assert isinstance(call, ast.Call)
+    values = [field.elts[2].value for field in call.args[0].elts]
+    assert values == [1, 2, 3]
+
+
+def test_length_operator_uses_builtin_len():
+    result = transpile(
+        """
+        local l = #items
+        """
+    )
+    assign = body_without_prefix(result)[0]
+    assert isinstance(assign, ast.Assign)
+    call = assign.value
+    assert isinstance(call, ast.Call)
+    assert isinstance(call.func, ast.Name)
+    assert call.func.id == "len"
 
 
 def test_anonymous_function_with_statements_is_hoisted():
@@ -388,8 +424,8 @@ def test_anonymous_function_with_statements_is_hoisted():
     assert assign.value.id == func_def.name
 
 
-def test_pico8_globals_are_wrapped_with_pyco8():
-    config = TransformerConfig(wrap_globals={"rnd"})
+def test_globals_are_wrapped_with_custom_container():
+    config = TransformerConfig(wrap_globals={"rnd"}, wrap_container="API")
     result = transpile(
         """
         x = rnd(5)
@@ -402,12 +438,12 @@ def test_pico8_globals_are_wrapped_with_pyco8():
     callee = call.func
     assert isinstance(callee, ast.Attribute)
     assert isinstance(callee.value, ast.Name)
-    assert callee.value.id == "PYCO8"
+    assert callee.value.id == "API"
     assert callee.attr == "rnd"
 
 
-def test_local_shadowing_skips_pyco8_wrap():
-    config = TransformerConfig(wrap_globals={"rnd"})
+def test_local_shadowing_skips_container_wrap():
+    config = TransformerConfig(wrap_globals={"rnd"}, wrap_container="API")
     result = transpile(
         """
         local rnd = 1
@@ -418,6 +454,32 @@ def test_local_shadowing_skips_pyco8_wrap():
     assign = body_without_prefix(result)[1]
     assert isinstance(assign.value, ast.Name)
     assert assign.value.id == "rnd"
+
+
+def test_wraps_body_in_custom_function():
+    config = TransformerConfig(
+        wrap_function_name="init_cart",
+        wrap_function_args=["api", "runtime"],
+    )
+    result = transpile(
+        """
+        x = 1
+        """,
+        config=config,
+    )
+    body = result.module.body
+    assert isinstance(body[0], ast.ImportFrom)
+    assert isinstance(body[1], ast.FunctionDef)
+    func = body[1]
+    assert func.name == "init_cart"
+    arg_names = [arg.arg for arg in func.args.args]
+    assert arg_names == ["api", "runtime"]
+    assert len(func.body) >= 3
+    assert all(isinstance(node, ast.Assign) for node in func.body[:2])
+    final_stmt = func.body[-1]
+    assert isinstance(final_stmt, ast.Assign)
+    assert isinstance(final_stmt.targets[0], ast.Name)
+    assert final_stmt.targets[0].id == "x"
 
 
 def test_keyword_locals_get_sanitized():

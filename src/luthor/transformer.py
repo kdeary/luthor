@@ -32,12 +32,13 @@ class TransformerConfig:
 
     inject_runtime_import: bool = True
     bundle_runtime: bool = False
-    wrap_pyco8_init: bool = False
     runtime_module: str = "luthor"
     runtime_symbol: str = "runtime"
     runtime_alias: str = "__lua_runtime"
     wrap_globals: Optional[Set[str]] = None
-    wrap_container: str = "PYCO8"
+    wrap_container: str = "API"
+    wrap_function_name: Optional[str] = None
+    wrap_function_args: Optional[List[str]] = None
 
 
 class LuaToPythonAstTransformer:
@@ -70,15 +71,16 @@ class LuaToPythonAstTransformer:
                     level=0,
                 )
             )
-        if self.config.wrap_pyco8_init:
+        builtin_nodes = self._lua_builtin_assignments()
+        body = builtin_nodes + body
+        wrap_name = self.config.wrap_function_name
+        if wrap_name:
+            arg_names = list(self.config.wrap_function_args or [])
             func_def = ast.FunctionDef(
-                name="pyco8_init",
+                name=wrap_name,
                 args=ast.arguments(
                     posonlyargs=[],
-                    args=[
-                        ast.arg(arg="PYCO8"),
-                        ast.arg(arg=self.config.runtime_alias),
-                    ],
+                    args=[ast.arg(arg=name) for name in arg_names],
                     vararg=None,
                     kwonlyargs=[],
                     kw_defaults=[],
@@ -107,10 +109,43 @@ class LuaToPythonAstTransformer:
     def _runtime_call(self, name: str, *args: ast.expr) -> ast.Call:
         return ast.Call(func=self._runtime_attr(name), args=list(args), keywords=[])
 
+    def _lua_builtin_assignments(self) -> List[ast.stmt]:
+        mapping = {
+            "setmetatable": "setmetatable",
+            "getmetatable": "getmetatable",
+            "pairs": "pairs",
+        }
+        assigns: List[ast.stmt] = []
+        for target_name, runtime_name in mapping.items():
+            assigns.append(
+                ast.Assign(
+                    targets=[ast.Name(id=target_name, ctx=ast.Store())],
+                    value=self._runtime_attr(runtime_name),
+                )
+            )
+        return assigns
+
 
     def _wrap_condition(self, expr: ast.expr) -> ast.expr:
         """Lua truthiness: only nil/false are falsy."""
+        if self._is_definitely_boolean(expr):
+            return expr
         return self._runtime_call("truthy", expr)
+
+    def _is_definitely_boolean(self, expr: ast.expr) -> bool:
+        """Return True when Python already guarantees a bool result."""
+        if isinstance(expr, ast.Compare):
+            return True
+        if isinstance(expr, ast.Constant) and isinstance(expr.value, bool):
+            return True
+        if isinstance(expr, ast.UnaryOp) and isinstance(expr.op, ast.Not):
+            return True
+        if isinstance(expr, ast.Call) and isinstance(expr.func, ast.Attribute):
+            func = expr.func
+            if isinstance(func.value, ast.Name) and func.value.id == self.config.runtime_alias:
+                if func.attr in {"lua_not", "truthy"}:
+                    return True
+        return False
 
     def _wrap_bool_op(
         self, runtime_name: str, left: ast.expr, right: ast.expr
@@ -167,6 +202,30 @@ class LuaToPythonAstTransformer:
             target = self._index_components(node)
             return func_name, target
         raise TransformerError("Function names with complex expressions are not supported yet.")
+
+    def _apply_default_placeholders(self, args_obj: ast.arguments) -> None:
+        args_obj.defaults = [ast.Constant(None) for _ in args_obj.args]
+
+    def _build_function_definition(self, node, *, is_local: bool = False) -> tuple[ast.FunctionDef, Optional[ast.stmt]]:
+        if is_local and isinstance(node.name, lua.Name):
+            self._declare_local(node.name.id)
+        func_name, assignment_target = self._function_binding(node.name)
+        args_ast, arg_names = self._build_arguments(node.args)
+        body = self._block(node.body, initial_locals=arg_names)
+        func_def = ast.FunctionDef(
+            name=func_name,
+            args=args_ast,
+            body=body,
+            decorator_list=[],
+            returns=None,
+            type_comment=None,
+        )
+        assignment: Optional[ast.stmt] = None
+        if assignment_target is not None:
+            table_expr, key_expr = assignment_target
+            target = ast.Subscript(value=table_expr, slice=key_expr, ctx=ast.Store())
+            assignment = ast.Assign(targets=[target], value=ast.Name(id=func_name, ctx=ast.Load()))
+        return func_def, assignment
 
     def _ensure_store(self, node: ast.AST) -> ast.AST:
         """Set ctx=Store for assignment targets."""
@@ -316,8 +375,12 @@ class LuaToPythonAstTransformer:
         else:
             python_body = []
             for stmt in node.body:
-                converted = self.visit(stmt)
-                self._append_converted(python_body, converted)
+                if isinstance(stmt, (lua.Function, lua.LocalFunction, lua.Method)):
+                    converted = self.visit(stmt)
+                    self._append_converted(python_body, converted)
+                else:
+                    converted = self.visit(stmt)
+                    self._append_converted(python_body, converted)
             if not python_body:
                 python_body.append(ast.Pass())
         hoisted = self._inline_stack.pop()
@@ -494,31 +557,18 @@ class LuaToPythonAstTransformer:
         raise TransformerError(f"Unexpected orelse payload: {node!r}")
 
     def visit_Function(self, node: lua.Function):
-        func_name, assignment_target = self._function_binding(node.name)
-        args, arg_names = self._build_arguments(node.args)
-        body = self._block(node.body, initial_locals=arg_names)
-        func_def = ast.FunctionDef(
-            name=func_name,
-            args=args,
-            body=body,
-            decorator_list=[],
-            returns=None,
-            type_comment=None,
-        )
-        if assignment_target is None:
-            return func_def
-        table_expr, key_expr = assignment_target
-        target = ast.Subscript(value=table_expr, slice=key_expr, ctx=ast.Store())
-        assign = ast.Assign(
-            targets=[target],
-            value=ast.Name(id=func_name, ctx=ast.Load()),
-        )
-        return [func_def, assign]
+        func_def, assignment = self._build_function_definition(node)
+        if not self._inline_stack:
+            raise TransformerError("Function defined outside of a block context.")
+        self._inline_stack[-1].append(func_def)
+        return assignment
 
     def visit_LocalFunction(self, node: lua.LocalFunction) -> ast.FunctionDef:
-        if isinstance(node.name, lua.Name):
-            self._declare_local(node.name.id)
-        return self.visit_Function(node)
+        func_def, assignment = self._build_function_definition(node, is_local=True)
+        if not self._inline_stack:
+            raise TransformerError("Function defined outside of a block context.")
+        self._inline_stack[-1].append(func_def)
+        return assignment
 
     def visit_Call(self, node: lua.Call) -> ast.Call:
         return self._build_call(node.func, node.args)
@@ -537,6 +587,7 @@ class LuaToPythonAstTransformer:
         func_name = method_name if method_name and method_name.isidentifier() else self._fresh_function_name()
         py_args, arg_names = self._build_arguments(node.args)
         py_args.args.insert(0, ast.arg(arg="self"))
+        self._apply_default_placeholders(py_args)
         locals_list = ["self"] + arg_names
         body = self._block(node.body, initial_locals=locals_list)
         table_expr = self.visit_expression(node.source)
@@ -554,7 +605,10 @@ class LuaToPythonAstTransformer:
             targets=[target],
             value=ast.Name(id=func_name, ctx=ast.Load()),
         )
-        return [func_def, assign]
+        if not self._inline_stack:
+            raise TransformerError("Method defined outside of a block context.")
+        self._inline_stack[-1].append(func_def)
+        return assign
 
     # -- expressions ----------------------------------------------------
 
@@ -635,11 +689,6 @@ class LuaToPythonAstTransformer:
                 ast.Tuple(elts=[ast.Constant(is_keyed), key, value], ctx=ast.Load())
             )
 
-        if has_keyed and not has_sequential:
-            return ast.Dict(keys=dict_keys, values=dict_values)
-        if has_sequential and not has_keyed:
-            return ast.List(elts=list_values, ctx=ast.Load())
-
         return self._runtime_call(
             "table_ctor", ast.List(elts=field_exprs, ctx=ast.Load())
         )
@@ -695,15 +744,17 @@ class LuaToPythonAstTransformer:
                 locals_list.append(sanitized)
             else:
                 raise TransformerError(f"Unsupported function argument {arg!r}")
-        return ast.arguments(
+        arguments = ast.arguments(
             posonlyargs=[],
             args=py_args,
-            vararg=vararg,
+            vararg=vararg or ast.arg(arg="__lua_extra_args"),
             kwonlyargs=[],
             kw_defaults=[],
             kwarg=None,
             defaults=[],
-        ), locals_list
+        )
+        self._apply_default_placeholders(arguments)
+        return arguments, locals_list
 
     def _build_call(
         self,
@@ -818,7 +869,11 @@ class LuaToPythonAstTransformer:
         return self._runtime_call("lua_not", self.visit_expression(node.operand))
 
     def visit_ULengthOP(self, node: lua.ULengthOP) -> ast.Call:
-        return self._runtime_call("lua_len", self.visit_expression(node.operand))
+        return ast.Call(
+            func=ast.Name(id="len", ctx=ast.Load()),
+            args=[self.visit_expression(node.operand)],
+            keywords=[],
+        )
 
     def visit_AndLoOp(self, node: lua.AndLoOp) -> ast.Call:
         return self._wrap_bool_op(
