@@ -28,6 +28,18 @@ def body_without_prefix(result):
     return result.module.body[PREFIX_LEN:]
 
 
+def global_initializers(result):
+    inits = []
+    for stmt in result.module.body:
+        if not isinstance(stmt, ast.Assign):
+            continue
+        if len(stmt.targets) != 1 or not isinstance(stmt.targets[0], ast.Name):
+            continue
+        if isinstance(stmt.value, ast.Constant) and stmt.value.value is None:
+            inits.append(stmt)
+    return inits
+
+
 def test_empty_chunk_emits_import_and_pass():
     result = transpile("")
     body = result.module.body
@@ -508,6 +520,40 @@ def test_keyword_function_argument_gets_sanitized():
     names = {node.id for node in ast.walk(fn) if isinstance(node, ast.Name)}
     assert "del" not in names
     assert "del_" in names
+
+
+def test_non_local_assignments_inside_functions_get_initialized():
+    result = transpile(
+        """
+        function tick()
+            score = score + 1
+        end
+        """
+    )
+    initializers = global_initializers(result)
+    init_names = [stmt.targets[0].id for stmt in initializers]
+    assert "score" in init_names
+    func_index = next(
+        idx for idx, node in enumerate(result.module.body) if isinstance(node, ast.FunctionDef)
+    )
+    score_init_index = next(
+        idx
+        for idx, node in enumerate(result.module.body)
+        if isinstance(node, ast.Assign)
+        and isinstance(node.targets[0], ast.Name)
+        and node.targets[0].id == "score"
+    )
+    assert score_init_index < func_index
+
+
+def test_top_level_assignment_skips_initializer():
+    result = transpile(
+        """
+        score = 1
+        """
+    )
+    init_names = [stmt.targets[0].id for stmt in global_initializers(result)]
+    assert "score" not in init_names
 
 
 def test_goto_translates_to_label_state_machine():

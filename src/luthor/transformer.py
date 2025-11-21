@@ -51,6 +51,10 @@ class LuaToPythonAstTransformer:
         self._inline_stack: List[List[ast.stmt]] = []
         self._current_label_var: Optional[str] = None
         self._locals_stack: List[set[str]] = [set()]
+        self._global_names: set[str] = set()
+        self._top_level_globals: set[str] = set()
+        self._function_depth = 0
+        self._function_global_stack: List[set[str]] = []
 
     # -- entrypoint -----------------------------------------------------
 
@@ -72,7 +76,8 @@ class LuaToPythonAstTransformer:
                 )
             )
         builtin_nodes = self._lua_builtin_assignments()
-        body = builtin_nodes + body
+        global_inits = self._global_init_assignments()
+        body = builtin_nodes + global_inits + body
         wrap_name = self.config.wrap_function_name
         if wrap_name:
             arg_names = list(self.config.wrap_function_args or [])
@@ -125,6 +130,12 @@ class LuaToPythonAstTransformer:
             )
         return assigns
 
+    def _global_init_assignments(self) -> List[ast.stmt]:
+        names = sorted(self._global_names - self._top_level_globals)
+        return [
+            ast.Assign(targets=[ast.Name(id=name, ctx=ast.Store())], value=ast.Constant(None))
+            for name in names
+        ]
 
     def _wrap_condition(self, expr: ast.expr) -> ast.expr:
         """Lua truthiness: only nil/false are falsy."""
@@ -210,8 +221,10 @@ class LuaToPythonAstTransformer:
         if is_local and isinstance(node.name, lua.Name):
             self._declare_local(node.name.id)
         func_name, assignment_target = self._function_binding(node.name)
+        if not is_local and isinstance(node.name, lua.Name):
+            self._record_global(func_name)
         args_ast, arg_names = self._build_arguments(node.args)
-        body = self._block(node.body, initial_locals=arg_names)
+        body = self._function_block(node.body, initial_locals=arg_names)
         func_def = ast.FunctionDef(
             name=func_name,
             args=args_ast,
@@ -245,6 +258,18 @@ class LuaToPythonAstTransformer:
 
     def _block(self, block: lua.Block, initial_locals: Optional[Iterable[str]] = None) -> List[ast.stmt]:
         return self.visit_Block(block, initial_locals=initial_locals)
+
+    def _function_block(self, block: lua.Block, initial_locals: Optional[Iterable[str]] = None) -> List[ast.stmt]:
+        self._function_global_stack.append(set())
+        self._function_depth += 1
+        try:
+            body = self._block(block, initial_locals=initial_locals)
+        finally:
+            self._function_depth -= 1
+            globals_in_function = self._function_global_stack.pop()
+        if globals_in_function:
+            body = [ast.Global(names=sorted(globals_in_function))] + body
+        return body
 
     def _expr_list(self, nodes: Iterable[lua.Expression]) -> List[ast.expr]:
         return [self.visit_expression(node) for node in nodes]
@@ -284,6 +309,22 @@ class LuaToPythonAstTransformer:
         if keyword.iskeyword(cleaned):
             cleaned = f"{cleaned}_"
         return cleaned
+
+    def _record_global(self, name: str) -> None:
+        """Track a non-local binding for later initialization."""
+        if name.startswith("__lua_"):
+            return
+        self._global_names.add(name)
+        if self._function_depth == 0:
+            self._top_level_globals.add(name)
+        if self._function_depth > 0 and self._function_global_stack:
+            self._function_global_stack[-1].add(name)
+
+    def _track_global_from_target(self, target_node: lua.Lhs) -> None:
+        if isinstance(target_node, lua.Name):
+            sanitized = self._sanitize_identifier(target_node.id)
+            if not self._is_local(sanitized):
+                self._record_global(sanitized)
 
     def _append_converted(self, body: List[ast.stmt], converted):
         if converted is None:
@@ -405,6 +446,8 @@ class LuaToPythonAstTransformer:
 
     def visit_Assign(self, node: lua.Assign):
         targets = list(node.targets)
+        for target in targets:
+            self._track_global_from_target(target)
         target_count = max(1, len(targets))
         values = self._expr_list(node.values or [])
         if not values:
@@ -437,6 +480,7 @@ class LuaToPythonAstTransformer:
                 temp_names.append(None)
                 continue
             temp_name = self._fresh_temp_name()
+            self._declare_local(temp_name)
             temp_names.append(temp_name)
             statements.append(
                 ast.Assign(
@@ -489,6 +533,8 @@ class LuaToPythonAstTransformer:
         return ast.While(test=ast.Constant(True), body=body, orelse=[])
 
     def visit_Fornum(self, node: lua.Fornum) -> ast.For:
+        if isinstance(node.target, lua.Name):
+            self._declare_local(self._sanitize_identifier(node.target.id))
         target = self._ensure_store(self.visit_Name(node.target, ctx=ast.Store()))
         if node.step is None:
             step_expr = ast.Constant(1)
@@ -510,6 +556,9 @@ class LuaToPythonAstTransformer:
         )
 
     def visit_Forin(self, node: lua.Forin) -> ast.For:
+        for target in node.targets:
+            if isinstance(target, lua.Name):
+                self._declare_local(self._sanitize_identifier(target.id))
         targets = [self.visit_Name(t, ctx=ast.Store()) for t in node.targets]
         target_expr: ast.expr
         if len(targets) == 1:
@@ -589,7 +638,7 @@ class LuaToPythonAstTransformer:
         py_args.args.insert(0, ast.arg(arg="self"))
         self._apply_default_placeholders(py_args)
         locals_list = ["self"] + arg_names
-        body = self._block(node.body, initial_locals=locals_list)
+        body = self._function_block(node.body, initial_locals=locals_list)
         table_expr = self.visit_expression(node.source)
         key_expr = ast.Constant(method_name) if method_name else self.visit_expression(node.name)
         func_def = ast.FunctionDef(
@@ -701,7 +750,7 @@ class LuaToPythonAstTransformer:
 
     def visit_AnonymousFunction(self, node: lua.AnonymousFunction) -> ast.Lambda:
         args, arg_names = self._build_arguments(node.args)
-        body = self._block(node.body, initial_locals=arg_names)
+        body = self._function_block(node.body, initial_locals=arg_names)
         func_name = self._fresh_function_name()
         func_def = ast.FunctionDef(
             name=func_name,
