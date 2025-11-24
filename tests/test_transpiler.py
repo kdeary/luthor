@@ -556,6 +556,18 @@ def test_top_level_assignment_skips_initializer():
     assert "score" not in init_names
 
 
+def test_top_level_assignment_gets_initialized_when_requested():
+    config = TransformerConfig(initialize_all_globals=True)
+    result = transpile(
+        """
+        score = 1
+        """,
+        config=config,
+    )
+    init_names = [stmt.targets[0].id for stmt in global_initializers(result)]
+    assert "score" in init_names
+
+
 def test_goto_translates_to_label_state_machine():
     result = transpile(
         """

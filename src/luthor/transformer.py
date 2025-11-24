@@ -35,6 +35,8 @@ class TransformerConfig:
     runtime_module: str = "luthor"
     runtime_symbol: str = "runtime"
     runtime_alias: str = "__lua_runtime"
+    initialize_globals: bool = True
+    initialize_all_globals: bool = False
     wrap_globals: Optional[Set[str]] = None
     wrap_container: str = "API"
     wrap_function_name: Optional[str] = None
@@ -51,16 +53,18 @@ class LuaToPythonAstTransformer:
         self._inline_stack: List[List[ast.stmt]] = []
         self._current_label_var: Optional[str] = None
         self._locals_stack: List[set[str]] = [set()]
-        self._global_names: set[str] = set()
-        self._top_level_globals: set[str] = set()
         self._function_depth = 0
         self._function_global_stack: List[set[str]] = []
+        self._globals_assigned: set[str] = set()
+        self._globals_in_functions: set[str] = set()
 
     # -- entrypoint -----------------------------------------------------
 
     def transform(self, chunk: lua.Chunk) -> ast.Module:
         if not isinstance(chunk, lua.Chunk):
             raise TypeError(f"Expected lua.Chunk, received {type(chunk)!r}")
+        self._globals_assigned.clear()
+        self._globals_in_functions.clear()
         body = self.visit_Block(chunk.body)
         runtime_prefix: List[ast.stmt] = []
         if self.config.bundle_runtime:
@@ -76,8 +80,8 @@ class LuaToPythonAstTransformer:
                 )
             )
         builtin_nodes = self._lua_builtin_assignments()
-        global_inits = self._global_init_assignments()
-        body = builtin_nodes + global_inits + body
+        initializer_nodes = self._global_initializers()
+        body = builtin_nodes + initializer_nodes + body
         wrap_name = self.config.wrap_function_name
         if wrap_name:
             arg_names = list(self.config.wrap_function_args or [])
@@ -129,13 +133,6 @@ class LuaToPythonAstTransformer:
                 )
             )
         return assigns
-
-    def _global_init_assignments(self) -> List[ast.stmt]:
-        names = sorted(self._global_names - self._top_level_globals)
-        return [
-            ast.Assign(targets=[ast.Name(id=name, ctx=ast.Store())], value=ast.Constant(None))
-            for name in names
-        ]
 
     def _wrap_condition(self, expr: ast.expr) -> ast.expr:
         """Lua truthiness: only nil/false are falsy."""
@@ -314,17 +311,31 @@ class LuaToPythonAstTransformer:
         """Track a non-local binding for later initialization."""
         if name.startswith("__lua_"):
             return
-        self._global_names.add(name)
-        if self._function_depth == 0:
-            self._top_level_globals.add(name)
-        if self._function_depth > 0 and self._function_global_stack:
-            self._function_global_stack[-1].add(name)
+        self._globals_assigned.add(name)
+        if self._function_depth > 0:
+            self._globals_in_functions.add(name)
+            if self._function_global_stack:
+                self._function_global_stack[-1].add(name)
 
     def _track_global_from_target(self, target_node: lua.Lhs) -> None:
         if isinstance(target_node, lua.Name):
             sanitized = self._sanitize_identifier(target_node.id)
             if not self._is_local(sanitized):
                 self._record_global(sanitized)
+
+    def _global_initializers(self) -> List[ast.stmt]:
+        if not self.config.initialize_globals:
+            return []
+        names = self._globals_assigned if self.config.initialize_all_globals else self._globals_in_functions
+        if not names:
+            return []
+        return [
+            ast.Assign(
+                targets=[ast.Name(id=name, ctx=ast.Store())],
+                value=ast.Constant(None),
+            )
+            for name in sorted(names)
+        ]
 
     def _append_converted(self, body: List[ast.stmt], converted):
         if converted is None:
@@ -925,15 +936,27 @@ class LuaToPythonAstTransformer:
         )
 
     def visit_AndLoOp(self, node: lua.AndLoOp) -> ast.Call:
-        return self._wrap_bool_op(
-            "lua_and",
-            self.visit_expression(node.left),
-            self.visit_expression(node.right),
+        return ast.BoolOp(
+            op=ast.And(),
+            values=[self.visit_expression(node.left), self.visit_expression(node.right)],
         )
 
     def visit_OrLoOp(self, node: lua.OrLoOp) -> ast.Call:
-        return self._wrap_bool_op(
-            "lua_or",
-            self.visit_expression(node.left),
-            self.visit_expression(node.right),
+        return ast.BoolOp(
+            op=ast.Or(),
+            values=[self.visit_expression(node.left), self.visit_expression(node.right)],
         )
+
+    # def visit_AndLoOp(self, node: lua.AndLoOp) -> ast.Call:
+    #     return self._wrap_bool_op(
+    #         "lua_and",
+    #         self.visit_expression(node.left),
+    #         self.visit_expression(node.right),
+    #     )
+
+    # def visit_OrLoOp(self, node: lua.OrLoOp) -> ast.Call:
+    #     return self._wrap_bool_op(
+    #         "lua_or",
+    #         self.visit_expression(node.left),
+    #         self.visit_expression(node.right),
+    #     )

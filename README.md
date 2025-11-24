@@ -17,12 +17,12 @@ The `luthor` CLI reads from a file (or stdin) and prints Python source (or write
 ```bash
 luthor INPUT.lua \
   --output OUTPUT.py \
-  --no-pretty   # optional: emit raw compile() buffer
+  --init-all-globals   # optional: preinitialize every global to None
 ```
 
 - `INPUT.lua`: defaults to stdin when omitted (handy for piping code).
 - `--output`: writes to disk; otherwise the generated Python is printed to stdout.
-- `--no-pretty`: skips `ast.unparse` so you get the raw `compile()` buffer when you prefer minimal formatting.
+- `--init-all-globals`: inserts `name = None` for every detected global binding to mimic Lua's default `nil` globals even when referenced before assignment.
 
 Every invocation injects `from luthor import runtime as __lua_runtime` at the top of the emitted module so the helpers in `luthor/runtime.py` are available.
 
@@ -46,3 +46,5 @@ compiled = transpiler.transpile_file(game)
 ```
 
 Both helpers return a `TranspileResult` dataclass containing the Python `ast.Module` (useful for inspections or further transforms) and the rendered source. The transformer always fixes locations on the module so you can pass it to `ast.unparse`, `compile`, or downstream tooling without extra work.
+
+To preinitialize every discovered global binding (including top-level assignments) to Python's `None`, pass `TransformerConfig(initialize_all_globals=True)` when constructing the transpiler or use the `--init-all-globals` flag with the CLI.

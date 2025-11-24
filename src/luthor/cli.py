@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from .transpiler import LuaToPythonTranspiler
+from .transpiler import LuaToPythonTranspiler, TransformerConfig
 
 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
@@ -22,12 +22,18 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         "--output",
         help="Output path for the generated Python (defaults to stdout).",
     )
+    parser.add_argument(
+        "--init-all-globals",
+        action="store_true",
+        help='Preinitialize every global variable to "None" before executing user code.',
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: Optional[list[str]] = None) -> int:
     args = parse_args(argv)
-    transpiler = LuaToPythonTranspiler()
+    config = TransformerConfig(initialize_all_globals=args.init_all_globals)
+    transpiler = LuaToPythonTranspiler(config=config)
 
     if args.input:
         source = Path(args.input).read_text()

@@ -5,7 +5,6 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 from antlr4 import CommonTokenStream, InputStream, Token
 from antlr4.error.ErrorListener import ConsoleErrorListener

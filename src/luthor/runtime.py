@@ -6,32 +6,26 @@ from dataclasses import dataclass
 import types
 from typing import Any, Callable, Iterable, Iterator, List, Optional, Sequence
 
-
 def truthy(value: Any) -> bool:
     """Lua truthiness: only False and None map to false."""
     return not (value is False or value is None)
 
-
 def lua_not(value: Any) -> bool:
     return not truthy(value)
-
 
 def lua_and(left_fn: Callable[[], Any], right_fn: Callable[[], Any]) -> Any:
     left = left_fn()
     return right_fn() if truthy(left) else left
 
-
 def lua_or(left_fn: Callable[[], Any], right_fn: Callable[[], Any]) -> Any:
     left = left_fn()
     return left if truthy(left) else right_fn()
-
 
 def concat(left: Any, right: Any) -> str:
     """Lua's `..` operator coerces operands to strings."""
     return f"{left}{right}"
 
-
-_MISSING = object()
+_MISSING = None
 
 def invoke(source: Any, method: Any, *args: Any) -> Any:
     """Implements the Lua colon syntax (implicit self argument)."""
@@ -112,8 +106,6 @@ class LuaTable:
 
     def __getitem__(self, key: Any) -> Any:
         value = self._raw_lookup(key)
-        if value is _MISSING:
-            raise KeyError(key)
         return value
 
     def __setitem__(self, key: Any, value: Any) -> None:
