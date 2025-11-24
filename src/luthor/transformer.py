@@ -81,7 +81,7 @@ class LuaToPythonAstTransformer:
             )
         builtin_nodes = self._lua_builtin_assignments()
         initializer_nodes = self._global_initializers()
-        body = builtin_nodes + initializer_nodes + body
+        body = builtin_nodes + body
         wrap_name = self.config.wrap_function_name
         if wrap_name:
             arg_names = list(self.config.wrap_function_args or [])
@@ -101,9 +101,9 @@ class LuaToPythonAstTransformer:
                 returns=None,
                 type_comment=None,
             )
-            body = runtime_prefix + [func_def]
+            body = runtime_prefix + initializer_nodes + [func_def]
         else:
-            body = runtime_prefix + body
+            body = runtime_prefix + initializer_nodes + body
         return ast.Module(body=body, type_ignores=[])
 
     # -- helpers --------------------------------------------------------
